@@ -392,8 +392,10 @@ def score_text(t):
     return round(_vader.polarity_scores(str(t))["compound"],4) if t else 0.0
 
 def sent_label(s):
-    if s>=0.05: return "Bullish 🟢"
-    if s<=-0.05: return "Bearish 🔴"
+    if s >= 0.3:   return "Strong Bullish 🚀"
+    if s >= 0.05:  return "Bullish 🟢"
+    if s <= -0.3:  return "Strong Bearish 💀"
+    if s <= -0.05: return "Bearish 🔴"
     return "Neutral ⚪"
 
 def compute_sentiment(news_df):
@@ -491,6 +493,15 @@ def predict_stock(df, symbol, sentiment_score=0.0):
         prob_up_rf = rf.predict_proba(today_sc)[0][1]
         prob_up_gb = gb.predict_proba(today_sc)[0][1]
         prob_up    = (prob_up_rf * 0.55 + prob_up_gb * 0.45)   # weighted ensemble
+
+        # ── ALPHA BOOST: strong sentiment shifts probability ─
+        # Real trading trick — strong news overrides weak technical signals
+        if sentiment_score >= 0.3:
+            prob_up = min(prob_up + 0.05, 0.97)   # strong bullish news → boost
+        elif sentiment_score <= -0.3:
+            prob_up = max(prob_up - 0.05, 0.03)   # strong bearish news → suppress
+        # ────────────────────────────────────────────────────
+
         prob_down  = 1 - prob_up
 
         direction  = "UP 🟢" if prob_up >= 0.5 else "DOWN 🔴"
@@ -525,9 +536,9 @@ def predict_stock(df, symbol, sentiment_score=0.0):
             "est_price_low": round(est_low, 2),
             "est_price_high":round(est_high, 2),
             "model_accuracy":round(np.mean(scores)*100, 1),
-            "rsi":           round(float(df["rsi"].iloc[-1]),1)       if "rsi"       in df.columns else None,
-            "macd_hist":     round(float(df["macd_hist"].iloc[-1]),4) if "macd_hist" in df.columns else None,
-            "bb_pct":        round(float(df["bb_pct"].iloc[-1])*100,1) if "bb_pct"  in df.columns else None,
+            "rsi":           round(float(df["rsi"].iloc[-1]),1)        if "rsi"       in df.columns else None,
+            "macd_hist":     round(float(df["macd_hist"].iloc[-1]),4)  if "macd_hist" in df.columns else None,
+            "bb_pct":        round(float(df["bb_pct"].iloc[-1])*100,1) if "bb_pct"   in df.columns else None,
             "vol_ratio":     round(float(df["vol_ratio"].iloc[-1]),2)  if "vol_ratio" in df.columns else None,
             "sentiment_score": round(sentiment_score,4),
             "updated_at":   datetime.now().strftime("%Y-%m-%d %H:%M IST"),
@@ -925,10 +936,32 @@ def main():
     sell_ct = (df["signal"].str.startswith("SELL")).sum()
     hold_ct = (df["signal"].str.startswith("HOLD")).sum()
     updated = df["updated_at"].iloc[0] if "updated_at" in df.columns else "—"
+    data_dt = df["date"].iloc[0]        if "date"       in df.columns else "—"
     avg_acc = df["model_accuracy"].mean() if "model_accuracy" in df.columns else 0
 
+    # ── Last refreshed banner ─────────────────────────────────
+    now_ist = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    st.markdown(f"""
+    <div style='background:#1a1a2e;border:1px solid #2a2a4a;border-radius:10px;
+                padding:10px 18px;display:flex;justify-content:space-between;
+                align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:8px'>
+      <div>
+        <span style='color:#8888aa;font-size:12px'>📅 Predictions data for</span>
+        <span style='color:#00d4ff;font-weight:700;font-size:15px;margin-left:8px'>{data_dt}</span>
+      </div>
+      <div>
+        <span style='color:#8888aa;font-size:12px'>⏱ Model trained at</span>
+        <span style='color:#ffd740;font-size:13px;margin-left:8px'>{updated}</span>
+      </div>
+      <div>
+        <span style='color:#8888aa;font-size:12px'>🌐 Page loaded at</span>
+        <span style='color:#aaaaaa;font-size:13px;margin-left:8px'>{now_ist} IST</span>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
     c1,c2,c3,c4,c5,c6 = st.columns(6)
-    c1.metric("🕐 Updated",       updated.split(" ")[0] if updated!="—" else "—")
+    c1.metric("📊 Stocks tracked", total)
     c2.metric("🟢 BUY",  buy_ct,  f"{buy_ct/total*100:.0f}%")
     c3.metric("🔴 SELL", sell_ct, f"{sell_ct/total*100:.0f}%")
     c4.metric("🟡 HOLD", hold_ct, f"{hold_ct/total*100:.0f}%")
@@ -969,13 +1002,113 @@ def main():
                 st.markdown(f"Sentiment: {x.get('sentiment_label','—')}")
 
     # ── TABS ──────────────────────────────────────────────────
-    t1,t2,t3,t4,t5 = st.tabs([
+    t0,t1,t2,t3,t4,t5 = st.tabs([
+        "🏆 Today's Top Picks",
         "🏦 NSE Stocks",
         "₿  Crypto",
         "📰 News & Sentiment",
         "📊 Signal Summary",
         "💼 My Portfolio",
     ])
+
+    # ─ TAB 0: TOP PICKS ───────────────────────────────────────
+    with t0:
+        st.markdown("## 🏆 Today's Top Picks")
+        st.caption(f"Best BUY and SELL signals for **{data_dt}** — ranked by confidence × model accuracy × sentiment boost")
+
+        nse_only    = df[df["market"]=="NSE"].copy()    if "market" in df.columns else df.copy()
+        crypto_only = df[df["market"]=="Crypto"].copy() if "market" in df.columns else pd.DataFrame()
+
+        def score_stock(row):
+            """Composite rank = confidence × accuracy × sentiment multiplier"""
+            conf  = row.get("confidence", 50)
+            acc   = row.get("model_accuracy", 50)
+            sent  = row.get("sentiment_score", 0)
+            boost = 1.1 if sent >= 0.3 else (0.9 if sent <= -0.3 else 1.0)
+            return round((conf * 0.6 + acc * 0.4) * boost, 2)
+
+        for section_label, section_df, currency in [
+            ("🏦 NSE Stocks", nse_only, "₹"),
+            ("₿ Crypto",     crypto_only, "$"),
+        ]:
+            if section_df.empty:
+                continue
+            section_df = section_df.copy()
+            section_df["rank_score"] = section_df.apply(score_stock, axis=1)
+
+            top_buy  = section_df[section_df["signal"].str.startswith("BUY")]\
+                           .sort_values("rank_score", ascending=False).head(5)
+            top_sell = section_df[section_df["signal"].str.startswith("SELL")]\
+                           .sort_values("rank_score", ascending=False).head(5)
+
+            st.markdown(f"### {section_label}")
+            col_buy, col_sell = st.columns(2)
+
+            with col_buy:
+                st.markdown("#### 🟢 Top 5 BUY Today")
+                if top_buy.empty:
+                    st.info("No strong BUY signals today.")
+                else:
+                    for i, (_, r) in enumerate(top_buy.iterrows(), 1):
+                        sent_str = r.get("sentiment_label","—")
+                        headline = str(r.get("top_headline",""))[:80]
+                        st.markdown(f"""
+<div style='background:#0d3b1e;border:1px solid #00e676;border-radius:10px;
+            padding:12px 16px;margin-bottom:10px'>
+  <div style='display:flex;justify-content:space-between;align-items:center'>
+    <span style='color:#00e676;font-size:17px;font-weight:700'>#{i} {r["symbol"]}</span>
+    <span style='color:#ffd740;font-size:13px'>Confidence: {r.get("confidence",0):.1f}%</span>
+  </div>
+  <div style='color:#aaffaa;font-size:12px;margin-top:4px'>
+    Close: <b>{currency}{r.get("last_close",0):.2f}</b> &nbsp;|&nbsp;
+    Est. High: <b>{currency}{r.get("est_price_high",0):.2f}</b> &nbsp;|&nbsp;
+    Accuracy: <b>{r.get("model_accuracy",0):.1f}%</b>
+  </div>
+  <div style='color:#88cc88;font-size:11px;margin-top:3px'>
+    Sentiment: {sent_str} &nbsp;|&nbsp; Score: {r.get("sentiment_score",0):+.3f}
+  </div>
+  {'<div style="color:#668866;font-size:11px;margin-top:4px;font-style:italic">📰 ' + headline + '...</div>' if headline and headline != 'nan' else ''}
+</div>""", unsafe_allow_html=True)
+
+            with col_sell:
+                st.markdown("#### 🔴 Top 5 SELL Today")
+                if top_sell.empty:
+                    st.info("No strong SELL signals today.")
+                else:
+                    for i, (_, r) in enumerate(top_sell.iterrows(), 1):
+                        sent_str = r.get("sentiment_label","—")
+                        headline = str(r.get("top_headline",""))[:80]
+                        st.markdown(f"""
+<div style='background:#3b0d0d;border:1px solid #ff5252;border-radius:10px;
+            padding:12px 16px;margin-bottom:10px'>
+  <div style='display:flex;justify-content:space-between;align-items:center'>
+    <span style='color:#ff5252;font-size:17px;font-weight:700'>#{i} {r["symbol"]}</span>
+    <span style='color:#ffd740;font-size:13px'>Confidence: {r.get("confidence",0):.1f}%</span>
+  </div>
+  <div style='color:#ffaaaa;font-size:12px;margin-top:4px'>
+    Close: <b>{currency}{r.get("last_close",0):.2f}</b> &nbsp;|&nbsp;
+    Est. Low: <b>{currency}{r.get("est_price_low",0):.2f}</b> &nbsp;|&nbsp;
+    Accuracy: <b>{r.get("model_accuracy",0):.1f}%</b>
+  </div>
+  <div style='color:#cc8888;font-size:11px;margin-top:3px'>
+    Sentiment: {sent_str} &nbsp;|&nbsp; Score: {r.get("sentiment_score",0):+.3f}
+  </div>
+  {'<div style="color:#886666;font-size:11px;margin-top:4px;font-style:italic">📰 ' + headline + '...</div>' if headline and headline != 'nan' else ''}
+</div>""", unsafe_allow_html=True)
+
+            st.divider()
+
+        # ── Explanation box ───────────────────────────────────
+        st.markdown("""
+<div style='background:#1a1a2e;border:1px solid #2a2a4a;border-radius:10px;padding:14px 18px'>
+  <p style='color:#00d4ff;font-weight:700;margin:0 0 8px'>🧠 How these picks are ranked</p>
+  <p style='color:#aaaaaa;font-size:13px;margin:0'>
+    <b>Rank Score</b> = (Confidence × 60% + Model Accuracy × 40%) × Sentiment Multiplier<br>
+    <b>Sentiment Multiplier:</b> Strong Bullish 🚀 = ×1.1 boost &nbsp;|&nbsp;
+    Strong Bearish 💀 = ×0.9 penalty &nbsp;|&nbsp; Others = ×1.0<br>
+    This is a simplified version of how quant funds score trade signals.
+  </p>
+</div>""", unsafe_allow_html=True)
 
     # ─ TAB 1: NSE ─────────────────────────────────────────────
     with t1:
